@@ -14,13 +14,15 @@ import csv
 import logging
 import random
 import re
+import requests
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from itertools import cycle
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
-from urllib.request import Request, build_opener
+from urllib.request import Request, build_opener, HTTPCookieProcessor
 from urllib.error import URLError
 import http.cookiejar
 import xml.etree.ElementTree as ET
@@ -30,6 +32,74 @@ log = logging.getLogger("brak_scraper")
 HOST = "https://bravsearch.bea-brak.de"
 CTX = "/bravsearch"
 INDEX_URL = f"{HOST}{CTX}/index.xhtml"
+
+# --- Proxy & Header Setup ---
+API_KEY = "ih0pzluqjthtlixlztt2xoxkyo3m08lrzchn3viv"  # Webshare API key
+
+HEADERS_LIST = [
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.0 Safari/605.1.15"
+        ),
+        "Accept-Language": "en-US,en;q=0.8",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/119.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.7",
+    },
+]
+
+
+def get_proxies(api_key: str) -> List[Dict[str, str]]:
+    """Retrieve proxies from the Webshare API."""
+    try:
+        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100"
+        resp = requests.get(url, headers={"Authorization": f"Token {api_key}"}, timeout=30)
+        resp.raise_for_status()
+        
+        proxies = []
+        for entry in resp.json().get("results", []):
+            user, pwd = entry["username"], entry["password"]
+            addr, port = entry["proxy_address"], entry["port"]
+            proxy_url = f"http://{user}:{pwd}@{addr}:{port}"
+            proxies.append({"http": proxy_url, "https": proxy_url})
+        
+        if proxies:
+            log.info(f"Loaded {len(proxies)} proxies from Webshare API")
+            return proxies
+        else:
+            log.warning("No proxies returned from Webshare API, using direct connection")
+            return [{}]  # Empty dict = no proxy
+    except Exception as e:
+        log.warning(f"Failed to load proxies from Webshare: {e}, using direct connection")
+        return [{}]
+
+
+proxy_list = get_proxies(API_KEY)
+proxy_cycle = cycle(proxy_list)
+header_cycle = cycle(HEADERS_LIST)
 
 
 def _sleep(base: float, jitter: float = 0.15) -> None:
@@ -169,6 +239,7 @@ class _ResultCardParser(HTMLParser):
         self._header_parts: List[str] = []
         self._current_li: List[str] = []
         self._lis: List[str] = []
+        self._current_info_id: Optional[str] = None
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         attr_map = {key: (value or "") for key, value in attrs}
@@ -178,13 +249,20 @@ class _ResultCardParser(HTMLParser):
             self._depth = 1
             self._header_parts = []
             self._lis = []
+            self._current_info_id = None
             return
 
         if not self._in_card:
             return
 
         self._depth += 1
-        if tag == "div" and "resultCardHeader" in classes:
+        
+        # Extract info button ID from commandlink
+        if tag == "a" and "resultCardDetailLink" in classes:
+            self._current_info_id = attr_map.get("id", "")
+        
+        # Check both div and span for resultCardHeader
+        if (tag in ("div", "span")) and "resultCardHeader" in classes:
             self._in_header = True
         if tag == "li":
             self._in_li = True
@@ -194,7 +272,7 @@ class _ResultCardParser(HTMLParser):
         if not self._in_card:
             return
 
-        if tag == "div" and self._in_header:
+        if (tag in ("div", "span")) and self._in_header:
             self._in_header = False
         if tag == "li" and self._in_li:
             text = _clean("".join(self._current_li))
@@ -206,7 +284,10 @@ class _ResultCardParser(HTMLParser):
         self._depth -= 1
         if self._depth <= 0:
             header = _clean("".join(self._header_parts))
-            self.cards.append({"header": header, "lis": list(self._lis)})
+            card_data: Dict[str, Iterable[str]] = {"header": header, "lis": list(self._lis)}
+            if self._current_info_id:
+                card_data["info_id"] = self._current_info_id
+            self.cards.append(card_data)
             self._in_card = False
             self._depth = 0
 
@@ -249,18 +330,22 @@ def _parse_cards(results_html: str, bar_label: str) -> List[Dict[str, str]]:
                 street = rest[-1]
                 office = " | ".join(rest[:-1]).strip()
 
-        out.append(
-            {
-                "bar": bar_label,
-                "name": name,
-                "professional_title": professional_title,
-                "office": office,
-                "street": street,
-                "zip": zip_code,
-                "city": city,
-                "zip_city_raw": zip_city_raw,
-            }
-        )
+        card_dict: Dict[str, str] = {
+            "bar": bar_label,
+            "name": name,
+            "professional_title": professional_title,
+            "office": office,
+            "street": street,
+            "zip": zip_code,
+            "city": city,
+            "zip_city_raw": zip_city_raw,
+        }
+        
+        # Include info_id if available for detail fetching
+        if "info_id" in card:
+            card_dict["info_id"] = card.get("info_id", "")
+        
+        out.append(card_dict)
 
     return out
 
@@ -313,7 +398,7 @@ class BRAVScraper:
         self._dbg = 0
 
         self.cookie_jar = http.cookiejar.CookieJar()
-        self.opener = build_opener(http.cookiejar.HTTPCookieProcessor(self.cookie_jar))
+        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -322,6 +407,16 @@ class BRAVScraper:
             "Accept-Language": "en,de;q=0.8",
             "Connection": "keep-alive",
         }
+        
+        # Proxy and header rotation tracking
+        self.request_count = 0
+        self.rotate_every = 20  # Rotate headers every 20 requests
+        self.current_headers = dict(self.headers)
+        self.current_proxy = {}  # Start with direct connection (empty dict)
+        
+        # Create requests session for proxy and header rotation support
+        self.session = requests.Session()
+        self.session.cookies = self.cookie_jar
 
     def _save(self, name: str, content: str, ext: str) -> None:
         if not self.debug_dir:
@@ -332,21 +427,47 @@ class BRAVScraper:
 
     def _request(self, method: str, url: str, *, headers=None, data=None) -> str:
         last_error: Optional[Exception] = None
+        
+        # Rotate headers every N requests
+        self.request_count += 1
+        if self.request_count % self.rotate_every == 0:
+            self.current_headers = dict(next(header_cycle))
+            log.debug(f"Rotating to new User-Agent (request #{self.request_count})")
+        
+        # Rotate proxies every 60 requests (3x header rotation)
+        if self.request_count % (self.rotate_every * 3) == 0:
+            self.current_proxy = next(proxy_cycle)
+            if self.current_proxy:
+                log.debug(f"Rotating to new proxy (request #{self.request_count})")
+        
         for attempt in range(1, self.max_retries + 1):
             try:
                 req_headers = dict(self.headers)
+                # Merge current rotated headers
+                req_headers.update(self.current_headers)
                 if headers:
                     req_headers.update(headers)
+                
                 payload = None
                 if data is not None:
                     payload = urlencode(data).encode("utf-8")
-                request = Request(url, data=payload, headers=req_headers, method=method)
-                with self.opener.open(request, timeout=self.timeout) as response:
-                    charset = response.headers.get_content_charset() or "utf-8"
-                    return response.read().decode(charset, errors="replace")
-            except (URLError, OSError) as exc:
+                
+                # Use requests session with proxy rotation
+                resp = self.session.request(
+                    method=method,
+                    url=url,
+                    data=payload,
+                    headers=req_headers,
+                    proxies=self.current_proxy,  # Use proxy for all requests (direct if empty dict)
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                return resp.text
+                
+            except (requests.RequestException, OSError) as exc:
                 last_error = exc
                 _sleep(0.4 * attempt)
+        
         raise RuntimeError(f"HTTP {method} failed after {self.max_retries} retries: {last_error}")
 
     def get_search_page(self) -> str:
@@ -465,6 +586,19 @@ class BRAVScraper:
         response = self._request("POST", INDEX_URL, headers=headers, data=data)
         self._save("ajax", response, "xml")
 
+        # Validate response is actual JSF partial-response before parsing
+        if not response or not response.strip():
+            raise RuntimeError(
+                "AJAX returned empty response. This usually indicates a server error or session issue."
+            )
+        
+        if not _is_jsf_partial(response):
+            snippet = response[:500] if len(response) > 500 else response
+            raise RuntimeError(
+                f"AJAX returned non-XML response (expected JSF partial-response). "
+                f"First 500 chars: {snippet}"
+            )
+
         updates, new_viewstate = _parse_partial_response(response)
         return updates, (new_viewstate or viewstate)
 
@@ -480,9 +614,10 @@ class BRAVScraper:
             form_id=sids.form_id,
             viewstate=sids.viewstate,
             source_id=sids.search_button_id,
-            execute=None,
+            execute=sids.form_id,
             render="mainPageContent",
             extra=extra,
+            behavior_event="click",
         )
 
         fragment = updates.get("mainPageContent") or ""
@@ -527,14 +662,20 @@ class BRAVScraper:
             form_id=ids.form_id,
             viewstate=viewstate,
             source_id=ids.update_data_result_source,
-            execute=None,
+            execute=ids.form_id,
             render=ids.form_id,
-            extra={},
+            extra=extra_page,
         )
 
         html = updates.get(ids.form_id) or ""
         if not html:
             keys = ", ".join(sorted(updates.keys()))
+            # If we're getting searchForm back instead of resultForm, the view has expired
+            if "searchForm" in keys:
+                raise RuntimeError(
+                    f"JSF view expired (server returned searchForm instead of resultForm). "
+                    f"This can happen after many pagination requests. Session needs to be refreshed."
+                )
             raise RuntimeError(
                 "updateDataResult returned no resultForm HTML update. "
                 f"Update keys: {keys}."
@@ -542,12 +683,98 @@ class BRAVScraper:
 
         return html, new_viewstate
 
+    def fetch_details(self, info_button_id: str, viewstate: str, form_id: str = "resultForm") -> Tuple[str, str]:
+        """Fetch detail page for a lawyer by clicking the info button."""
+        render_target = "resultDetailForm"
+        
+        updates, new_viewstate = self.ajax(
+            form_id=form_id,
+            viewstate=viewstate,
+            source_id=info_button_id,
+            execute=None,
+            render=render_target,
+        )
+        
+        detail_html = updates.get(render_target) or ""
+        if not detail_html:
+            keys = ", ".join(sorted(updates.keys()))
+            raise RuntimeError(
+                f"Detail fetch returned no {render_target} update. "
+                f"Update keys: {keys}."
+            )
+        
+        return detail_html, new_viewstate
+
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(levelname)s:%(name)s:%(message)s",
     )
+
+
+
+
+def _clean(s: str) -> str:
+    """Strip whitespace and normalize."""
+    return re.sub(r'\s+', ' ', s.strip())
+
+
+def _extract_details(detail_html: str) -> Dict[str, str]:
+    """Extract detail fields from detail page HTML using row-based parsing."""
+    details: Dict[str, str] = {}
+    label_map = {
+        "email": "email",
+        "mobile_phone": "mobile_phone",
+        "telephone": "telephone",
+        "telefax": "telefax",
+        "date_of_admission": "date_of_admission",
+        "date_of_first_admission": "date_of_first_admission",
+        "bar_membership": "bar_membership",
+        "professional_title": "detail_professional_title",
+        "form_of_address": "form_of_address",
+        "first_name_last_name": "first_name_last_name",
+        "law_office": "detail_office",
+        "office_address": "detail_street",
+        "internet_address": "internet_address",
+        "bea_safeid": "bea_safe_id",
+        "interest_for_getting_appointed_by_court_as_defence_counsel": "court_appointment_interest",
+    }
+    
+    # Split by cssRow divs - simpler pattern that works for all rows including the last one
+    row_pattern = r'<div class="cssRow">(.*?)(?=<div class="cssRow"|$)'
+    
+    for row_match in re.finditer(row_pattern, detail_html, re.DOTALL | re.IGNORECASE):
+        row_html = row_match.group(1)
+        
+        # Extract label
+        label_match = re.search(r'<label[^>]*>([^<]*?)</label>', row_html, re.DOTALL | re.IGNORECASE)
+        if not label_match:
+            continue
+        
+        label_text = _clean(label_match.group(1)).rstrip(":")
+        if not label_text:
+            continue
+        
+        # Extract value - look for text in cssColResultDetail* divs
+        value_match = re.search(r'cssColResultDetail(?:Text|TextGroup)[^>]*>(.*?)(?=</div)', row_html, re.DOTALL | re.IGNORECASE)
+        if not value_match:
+            continue
+        
+        value_html = value_match.group(1)
+        # Remove HTML tags to get plain text, preserving some spacing for multi-line values
+        value_text = re.sub(r'<[^>]+>', '\n', value_html)
+        value_text = '\n'.join(line.strip() for line in value_text.split('\n') if line.strip())
+        value_text = _clean(value_text.replace('\n', ' '))
+        
+        if value_text and value_text != "No Information":
+            # Normalize label for lookup (remove hyphens and special chars, lowercase, replace spaces with underscores)
+            normalized = label_text.lower().replace('-', '').replace(' ', '_')
+            key = label_map.get(normalized, normalized)
+            if key not in details:  # Don't overwrite if already found
+                details[key] = value_text
+    
+    return details
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -582,7 +809,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         wanted = all_bars
 
-    fieldnames = ["bar", "name", "professional_title", "office", "street", "zip", "city", "zip_city_raw"]
+    fieldnames = [
+        "bar", "name", "professional_title", "office", "street", "zip", "city", "zip_city_raw",
+        "email", "mobile_phone", "telephone", "telefax",
+        "date_of_admission", "date_of_first_admission", "bar_membership", "bea_safe_id",
+        "form_of_address", "first_name_last_name", "detail_professional_title",
+        "detail_office", "detail_street", "internet_address", "court_appointment_interest"
+    ]
 
     total_written = 0
 
@@ -598,10 +831,42 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         first = 0
         while first < total:
-            page_html, new_viewstate = scraper.fetch_page(ids, first=first, rows=args.rows)
-            ids.viewstate = new_viewstate
+            try:
+                page_html, new_viewstate = scraper.fetch_page(ids, first=first, rows=args.rows)
+                ids.viewstate = new_viewstate
+            except RuntimeError as e:
+                if "JSF view expired" in str(e):
+                    log.warning(f"JSF view expired at offset {first}. Refreshing search session...")
+                    results_html, viewstate = scraper.ajax_search_by_bar(bar_value=bar_value, language="en")
+                    ids = scraper.parse_result_ids(results_html, viewstate=viewstate)
+                    # Retry this page
+                    try:
+                        page_html, new_viewstate = scraper.fetch_page(ids, first=first, rows=args.rows)
+                        ids.viewstate = new_viewstate
+                    except Exception as retry_error:
+                        log.error(f"Failed to fetch page after refresh: {retry_error}")
+                        raise
+                else:
+                    raise
 
             cards = _parse_cards(page_html, bar_label=bar_label)
+            
+            # Fetch details for each card to extract additional fields
+            for card in cards:
+                info_id = card.get("info_id")
+                if info_id:
+                    try:
+                        detail_html, new_viewstate = scraper.fetch_details(
+                            info_button_id=info_id, 
+                            viewstate=ids.viewstate
+                        )
+                        ids.viewstate = new_viewstate
+                        details = _extract_details(detail_html)
+                        card.update(details)
+                        _sleep(scraper.sleep_s)
+                    except Exception as e:
+                        log.warning(f"Failed to fetch details for {card.get('name')}: {e}")
+            
             _write_csv(args.out, cards, fieldnames)
 
             total_written += len(cards)
